@@ -1,0 +1,53 @@
+name: PA tarayici (saatlik)
+
+on:
+  schedule:
+    - cron: "3 * * * *"        # her saat başı +3 dk (UTC) — 1H mumu kapandıktan sonra
+  workflow_dispatch:            # Actions sekmesinden elle çalıştırma
+
+concurrency:
+  group: tarayici
+  cancel-in-progress: false
+
+jobs:
+  tara:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # durum.json = en son bildirilen 1H mumu (aynı olay iki kez gelmesin)
+      - name: Durumu geri yükle
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            durum.json
+            cg_yedek.json
+          key: durum-${{ github.run_id }}
+          restore-keys: durum-
+
+      - name: Tara ve bildir
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          COINLER: ${{ vars.COINLER }}
+          COIN_SAYISI: ${{ vars.COIN_SAYISI || '50' }}
+          EK_COINLER: ${{ vars.EK_COINLER || 'ATOM,OP,APT' }}
+          ENDEKS: ${{ vars.ENDEKS || '1' }}
+          POI_TF: ${{ vars.POI_TF || '4H,1G,1W' }}
+          YAKLAS_YUZDE: ${{ vars.YAKLAS_YUZDE || '0.5' }}
+        run: python tarayici.py
+
+      - name: Durumu kaydet
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            durum.json
+            cg_yedek.json
+          key: durum-${{ github.run_id }}
