@@ -1,5 +1,6 @@
 """
-moduller.py — TradingView M3 / M5 / M6 / M7 / M8 Pine modüllerinin Python karşılığı (21.11.2026).
+moduller.py — TradingView M3 / M5 / M6 / M7 / M8 / M9 Pine modüllerinin Python karşılığı (21.11 · eşitleme 22.11.2026:
+M3 renk şartı + geçiş kuralı · M5 / M8 geçiş kuralı + iç OB yeni L/H · M9 likidite alımı).
 
 Her modül kendi zaman diliminin KAPANMIŞ mumlarını sırayla işler (Pine'daki request.security + [1]).
 Bar listesi: B = dict(t=[açılış ms], o=[], h=[], l=[], c=[]) ; mum i işlenir (Pine'da [1] = i, [2] = i-1 …).
@@ -184,21 +185,30 @@ def _keep(lst, n, live=lambda z: True, nDead=None, side='d'):
 class M3:
     ad = "M3"
 
-    def __init__(self, B, keepN=5, invOn=True, usedPct=51, reactOn=True):
+    def __init__(self, B, keepN=5, invOn=True, usedPct=51, reactOn=True, sameC=True, thruOn=True):
         self.B = B
         self.keepN, self.invOn, self.usedPct, self.reactOn = keepN, invOn, usedPct, reactOn
+        self.sameC, self.thruOn = sameC, thruOn
         self.Z = []
         self.sw = Swing()
 
     def step(self, i):
         B = self.B
-        h, l, c = B['h'][i], B['l'][i], B['c'][i]
+        O, H, L, C = B['o'], B['h'], B['l'], B['c']
+        h, l, c = H[i], L[i], C[i]
         self.sw.step(i, h, l, c)
         keep = []
         for z in self.Z:
             d, zt, zb = z['d'], z['top'], z['bot']
             if (d == 1 and c < zb) or (d == -1 and c > zt):
                 if self.invOn and not z['inv']:
+                    z.update(inv=True, d=-d, u=False, k=False)
+                else:
+                    continue
+            elif (self.thruOn and i >= 1 and not z['u'] and not z['k'] and
+                  ((d == 1 and L[i - 1] > zt and l < zb) or (d == -1 and H[i - 1] < zb and h > zt))):
+                # GEÇİŞ KURALI (22.11): ilk giriş mumu karşı ucu da aştı → IFVG; IFVG ise sil
+                if not z['inv']:
                     z.update(inv=True, d=-d, u=False, k=False)
                 else:
                     continue
@@ -215,9 +225,12 @@ class M3:
         self.Z = keep
         if i >= 2:
             h3, l3, t3 = B['h'][i - 2], B['l'][i - 2], B['t'][i - 2]
-            if l > h3:
+            # RENK ŞARTI (22.11): 3 mum aynı renk (doji sayılmaz)
+            allG = all(C[k] > O[k] for k in (i, i - 1, i - 2))
+            allR = all(C[k] < O[k] for k in (i, i - 1, i - 2))
+            if l > h3 and (not self.sameC or allG):
                 self.Z.append(dict(top=l, bot=h3, d=1, inv=False, s=t3, u=False, k=False))
-            if h < l3:
+            if h < l3 and (not self.sameC or allR):
                 self.Z.append(dict(top=l3, bot=h, d=-1, inv=False, s=t3, u=False, k=False))
         self.Z = _keep(self.Z, self.keepN, live=lambda z: not z['u'])
 
@@ -231,7 +244,7 @@ class M3:
             nm = f"{tf} M3 {'IFVG' if z['inv'] else 'FVG'}{'+' if d == 1 else '-'}"
             tag = " ⚠ trend tersi" if (d == 1 and tr == -1) or (d == -1 and tr == 1) else ""
             out.append(dict(key=f"M3|{tf}|{z['s']}|{d}|{'i' if z['inv'] else 'n'}", top=z['top'], bot=z['bot'],
-                            d=d, ad=nm, tag=tag, anySide=True))
+                            d=d, ad=nm, tag=tag, anySide=True, thru=self.thruOn))
         return out
 
 
@@ -241,11 +254,13 @@ class M3:
 class M5:
     ad = "M5"
 
-    def __init__(self, B, keepN=5, brkOn=True, kykRef=10, kykMul=1.2, kykAvg=20, kykN=3, iobRef=5, iobN=3):
+    def __init__(self, B, keepN=5, brkOn=True, kykRef=10, kykMul=1.2, kykAvg=20, kykN=3, iobRef=5, iobN=3,
+                 thruOn=True, newOn=True):
         self.B = B
         self.keepN, self.brkOn = keepN, brkOn
         self.kykRef, self.kykMul, self.kykAvg, self.kykN = kykRef, kykMul, kykAvg, kykN
         self.iobRef, self.iobN = iobRef, iobN
+        self.thruOn, self.newOn = thruOn, newOn
         self.R, self.P, self.Q, self.IP, self.IQ = [], [], [], [], []
         self.sw = Swing()
         self.PH = self.PL = None
@@ -276,10 +291,28 @@ class M5:
             if l <= z['top'] and h >= z['bot'] and not (L[i - 1] <= z['top'] and H[i - 1] >= z['bot']):
                 z['test'] += 1
 
+        def thru(z):
+            """GEÇİŞ KURALI (22.11): ilk giriş mumu (test yok, önceki mum tamamen dışarıda) karşı ucu da aştı."""
+            d = z['d']
+            return self.thruOn and z['test'] == 0 and (
+                (d == 1 and L[i - 1] > z['top'] and l < z['bot']) or (d == -1 and H[i - 1] < z['bot'] and h > z['top']))
+
+        def kutu_guncelle(lst):
+            """KYK ve iç OB: geçiş → ters rol (ters ise sil) · gövdeyle kırılım → sil · değilse test say."""
+            keep = []
+            for z in lst:
+                th = thru(z)
+                if th and not z['inv']:
+                    z.update(d=-z['d'], test=0, inv=True)
+                elif th or (z['d'] == -1 and c > z['top']) or (z['d'] == 1 and c < z['bot']):
+                    continue
+                else:
+                    tst(z)
+                keep.append(z)
+            return keep
+
         # ── KYK / YKY kutuları
-        self.Q = [z for z in self.Q if not ((z['d'] == -1 and c > z['top']) or (z['d'] == 1 and c < z['bot']))]
-        for z in self.Q:
-            tst(z)
+        self.Q = kutu_guncelle(self.Q)
         if i >= 3 + self.kykRef and i >= self.kykAvg + 1:
             r1, g1 = C[i - 2] < O[i - 2], C[i - 2] > O[i - 2]
             r2, g2 = C[i - 1] < O[i - 1], C[i - 1] > O[i - 1]
@@ -298,41 +331,57 @@ class M5:
             okB = c < p['ref'] if p['d'] == -1 else c > p['ref']
             if kill or okB:
                 if okB and not kill:
-                    self.Q.append(dict(top=p['top'], bot=p['bot'], d=p['d'], t0=p['t0'], test=0))
+                    self.Q.append(dict(top=p['top'], bot=p['bot'], d=p['d'], t0=p['t0'], test=0, inv=False))
                 continue
             keepP.append(p)
         self.P = keepP
         self.Q = _keep(self.Q, self.kykN)
 
         # ── iç yapı OB
-        self.IQ = [z for z in self.IQ if not ((z['d'] == -1 and c > z['top']) or (z['d'] == 1 and c < z['bot']))]
+        # YENİ L / H (22.11): hazır değilse önce temas → düşer; dokunmadan uç geçildi → hazır
+        keepI = []
         for z in self.IQ:
-            tst(z)
+            if not z['rdy']:
+                if l <= z['top'] and h >= z['bot']:
+                    continue
+                if (z['d'] == -1 and l < z['ex']) or (z['d'] == 1 and h > z['ex']):
+                    z['rdy'] = True
+                keepI.append(z)
+            else:
+                keepI.extend(kutu_guncelle([z]))
+        self.IQ = keepI
         keepP = []
         for p in self.IP:
+            p['ex'] = min(p['ex'], l) if p['d'] == -1 else max(p['ex'], h)
             gone = h > p['top'] if p['d'] == -1 else l < p['bot']
             ok = c < p['ref'] if p['d'] == -1 else c > p['ref']
             if gone or ok:
                 if ok and not gone:
-                    self.IQ.append(dict(top=p['top'], bot=p['bot'], d=p['d'], t0=p['t0'], test=0))
+                    self.IQ.append(dict(top=p['top'], bot=p['bot'], d=p['d'], t0=p['t0'], test=0, inv=False,
+                                        ex=p['ex'], rdy=not self.newOn))
                 continue
             keepP.append(p)
         self.IP = keepP
         gC, rC = C[i] > O[i], C[i] < O[i]
         if (gC or rC) and i >= self.iobRef:
             rf = min(L[i - self.iobRef:i]) if gC else max(H[i - self.iobRef:i])
-            self.IP.append(dict(top=h, bot=l, d=-1 if gC else 1, t0=T[i], ref=rf))
+            self.IP.append(dict(top=h, bot=l, d=-1 if gC else 1, t0=T[i], ref=rf, ex=l if gC else h))
             if len(self.IP) > 40:
                 self.IP.pop(0)
-        self.IQ = _keep(self.IQ, self.iobN)
+        self.IQ = _keep(self.IQ, self.iobN, live=lambda z: z['rdy'])
 
-        # ── mevcut OB: kırılım (breaker / sil) + test
+        # ── mevcut OB: geçiş (çalışmayan → ters rol) · kırılım (breaker / sil) · test
         keepR = []
         for z in self.R:
             d = z['d']
-            if (d == 1 and c < z['bot']) or (d == -1 and c > z['top']):
+            if thru(z):
+                if z['brk'] == 0:
+                    z.update(brk=2, d=-d, test=0)
+                else:
+                    continue
+            elif (d == 1 and c < z['bot']) or (d == -1 and c > z['top']):
                 if self.brkOn and not z['brk']:
-                    z.update(brk=True, d=-d, test=0)
+                    z.update(brk=1, d=-d, test=0)
                 else:
                     continue
             else:
@@ -391,15 +440,17 @@ class M5:
             mid = (top + bot) / 2
             okH = eq is not None and (mid <= eq if dd == 1 else mid >= eq)
             self.R.append(dict(top=top, bot=bot, d=dd, kind=r['kind'], liq=r['liq'], A=imb and okH, sw=isSw,
-                               cln=cln, kyk=kyk, brk=False, test=0, t0=T[jl]))
+                               cln=cln, kyk=kyk, brk=0, test=0, t0=T[jl]))
         self.R = _keep(self.R, self.keepN)
 
     def zones(self, tf):
         out = []
         for z in self.R:
             d = z['d']
-            if z['brk']:
+            if z['brk'] == 1:
                 nm = f"{tf} M5 Breaker{'+' if d == 1 else '-'}"
+            elif z['brk'] == 2:
+                nm = f"{tf} M5 çalışmayan OB{'+' if d == 1 else '-'}"
             else:
                 nm = f"{tf} M5 OB{'+' if d == 1 else '-'} {'A' if z['A'] else 'B'}"
             tag = ""
@@ -414,14 +465,19 @@ class M5:
                 tag += " YKY" if z['kyk'] == 1 else " KYK"
             if z['test']:
                 tag += f" test {z['test']}"
-            out.append(dict(key=f"M5|{tf}|{z['t0']}|{d}|{1 if z['brk'] else 0}", top=z['top'], bot=z['bot'], d=d,
-                            ad=nm, tag=tag, anySide=True))
+            out.append(dict(key=f"M5|{tf}|{z['t0']}|{d}|{z['brk']}", top=z['top'], bot=z['bot'], d=d,
+                            ad=nm, tag=tag, anySide=True, thru=self.thruOn))
         for z in self.Q:
-            out.append(dict(key=f"M5K|{tf}|{z['t0']}|{z['d']}", top=z['top'], bot=z['bot'], d=z['d'],
-                            ad=f"{tf} M5 {'YKY' if z['d'] == 1 else 'KYK'} kutusu", tag="", anySide=False))
+            d, v = z['d'], z['inv']
+            nm = ('YKY' if (-d if v else d) == 1 else 'KYK') + (f" çalışmayan{'+' if d == 1 else '-'}" if v else " kutusu")
+            out.append(dict(key=f"M5K|{tf}|{z['t0']}|{d}", top=z['top'], bot=z['bot'], d=d,
+                            ad=f"{tf} M5 {nm}", tag="", anySide=False, thru=self.thruOn))
         for z in self.IQ:
+            if not z['rdy']:
+                continue
+            nm = ("çalışmayan iç OB" if z['inv'] else "iç OB") + ('+' if z['d'] == 1 else '-')
             out.append(dict(key=f"M5I|{tf}|{z['t0']}|{z['d']}", top=z['top'], bot=z['bot'], d=z['d'],
-                            ad=f"{tf} M5 iç OB{'+' if z['d'] == 1 else '-'}", tag="", anySide=False))
+                            ad=f"{tf} M5 {nm}", tag=" yeni L/H" if self.newOn else "", anySide=False, thru=self.thruOn))
         return out
 
 
@@ -576,8 +632,9 @@ class M8:
     ad = "M8"
 
     def __init__(self, B, iobRef=5, iobExp=30, iobN=3, liqOn=True, liqW=5, liqS=5, fvgOn=True,
-                 wideOn=False, wideN=10, llOn=False, llS=3):
+                 wideOn=False, wideN=10, llOn=False, llS=3, newOn=True, thruOn=True):
         self.B = B
+        self.newOn, self.thruOn = newOn, thruOn
         self.iobRef, self.iobExp, self.iobN = iobRef, iobExp, iobN
         self.liqOn, self.liqW, self.liqS, self.fvgOn = liqOn, liqW, liqS, fvgOn
         self.wideOn, self.wideN, self.llOn, self.llS = wideOn, wideN, llOn, llS
@@ -616,9 +673,24 @@ class M8:
         # onaylılar
         keep = []
         for z in self.Q:
-            if (z['d'] == -1 and c > z['top']) or (z['d'] == 1 and c < z['bot']):
+            d, zt, zb = z['d'], z['top'], z['bot']
+            tch = l <= zt and h >= zb
+            if not z['rdy']:
+                # 5 YENİ L / H (22.11): önce temas → düşer; dokunmadan uç geçildi → hazır
+                if tch:
+                    continue
+                if (d == -1 and l < z['ex']) or (d == 1 and h > z['ex']):
+                    z['rdy'] = True
+                keep.append(z)
                 continue
-            if l <= z['top'] and h >= z['bot'] and not (L[i - 1] <= z['top'] and H[i - 1] >= z['bot']):
+            # GEÇİŞ KURALI (22.11): ilk giriş mumu karşı ucu da aştı → çalışmayan, ters rol (ters ise sil)
+            th = self.thruOn and z['test'] == 0 and (
+                (d == 1 and L[i - 1] > zt and l < zb) or (d == -1 and H[i - 1] < zb and h > zt))
+            if th and not z['inv']:
+                z.update(d=-d, test=0, inv=True)
+            elif th or (d == -1 and c > zt) or (d == 1 and c < zb):
+                continue
+            elif tch and not (L[i - 1] <= zt and H[i - 1] >= zb):
                 z['test'] += 1
             keep.append(z)
         self.Q = keep
@@ -626,6 +698,7 @@ class M8:
         keepP = []
         for p in self.P:
             pd = p['d']
+            p['ex'] = min(p['ex'], l) if pd == -1 else max(p['ex'], h)
             br = p['br'] or (c < p['ref'] if pd == -1 else c > p['ref'])
             fv = p['fv'] or (i - 2 >= p['bi'] and (h < L[i - 2] if pd == -1 else l > H[i - 2]))
             gone = (h > p['top'] if pd == -1 else l < p['bot']) or i - p['bi'] > self.iobExp
@@ -633,7 +706,8 @@ class M8:
             if gone or ok:
                 if ok and not gone:
                     self.Q.append(dict(top=p['top'], bot=p['bot'], d=pd, t0=p['t0'], test=0,
-                                       lv=self.swHv if pd == -1 else self.swLv))
+                                       lv=self.swHv if pd == -1 else self.swLv,
+                                       inv=False, ex=p['ex'], rdy=not self.newOn))
                 continue
             p['br'], p['fv'] = br, fv
             keepP.append(p)
@@ -651,20 +725,91 @@ class M8:
                         rf = min(rf, self.fL)
                     if rC and self.fH is not None:
                         rf = max(rf, self.fH)
-                self.P.append(dict(top=h, bot=l, d=dr, t0=T[i], ref=rf, bi=i, br=False, fv=False))
+                self.P.append(dict(top=h, bot=l, d=dr, t0=T[i], ref=rf, bi=i, br=False, fv=False,
+                                   ex=l if gC else h))
                 if len(self.P) > 200:
                     self.P.pop(0)
-        self.Q = _keep(self.Q, self.iobN)
+        self.Q = _keep(self.Q, self.iobN, live=lambda z: z['rdy'])
 
     def zones(self, tf):
         tg = (" lik." if self.liqOn else "") + (" FVG" if self.fvgOn else "") + (" geniş" if self.wideOn else "")
         out = []
         for z in self.Q:
-            t = tg + ((" HH" if z['d'] == 1 else " LL") if self.llOn else "")
+            if not z['rdy']:
+                continue
+            t = tg + ((" HH" if z['d'] == 1 else " LL") if self.llOn else "") + (" yeni L/H" if self.newOn else "")
             if z['test']:
                 t += f" test {z['test']}"
+            nm = ("M8 çalışmayan OB" if z['inv'] else "M8 OB") + ('+' if z['d'] == 1 else '-')
             out.append(dict(key=f"M8|{tf}|{z['t0']}|{z['d']}", top=z['top'], bot=z['bot'], d=z['d'],
-                            ad=f"{tf} M8 OB{'+' if z['d'] == 1 else '-'}", tag=t, anySide=False))
+                            ad=f"{tf} {nm}", tag=t, anySide=False, thru=self.thruOn))
+        return out
+
+
+# ════════════════════════════════════════════════════════════════
+# M9 — Likidite alımı (swing + range tepe / dip) · 22.11.2026
+#  Zig zag noktaları = seviye; fitil öteye + içeride kapanış = alındı (sinyal), gövde öteye = kırıldı.
+# ════════════════════════════════════════════════════════════════
+class M9:
+    ad = "M9"
+
+    def __init__(self, B, keepN=5, keepD=3):
+        self.B = B
+        self.keepN, self.keepD = keepN, keepD
+        self.Z = []
+        self.sw = Swing()
+        self.PH = self.PL = None
+        self.lastTyp = 0
+
+    def step(self, i):
+        B = self.B
+        H, L, C, T = B['h'], B['l'], B['c'], B['t']
+        h, l, c = H[i], L[i], C[i]
+        # 1) aktif seviyeler: alındı / kırıldı
+        for z in self.Z:
+            if z['st'] == 0:
+                sd, lv = z['sd'], z['lv']
+                if (h > lv) if sd == 1 else (l < lv):
+                    brk = (c > lv) if sd == 1 else (c < lv)
+                    z.update(st=2 if brk else 1, ts=T[i], bi=i, wx=h if sd == 1 else l,
+                             rng=(sd == 1 and lv == self.PH) or (sd == -1 and lv == self.PL))
+        # 2) swing motoru  3) yeni zig zag noktası (aynı türden daha uç → aktif seviye taşınır)
+        r = self.sw.step(i, h, l, c)
+        for sd, np_, npb in ((1, r['hp'], r['hpB']), (-1, r['lp'], r['lpB'])):
+            if np_ is None:
+                continue
+            same = self.lastTyp == sd
+            more = same and (np_ > self.PH if sd == 1 else np_ < self.PL)
+            if same and not more:
+                continue
+            old = self.PH if sd == 1 else self.PL
+            moved = False
+            if more:
+                for z in reversed(self.Z):
+                    if z['sd'] == sd and z['lv'] == old and z['st'] == 0:
+                        z.update(lv=np_, t0=T[npb])
+                        moved = True
+                        break
+            if not moved:
+                self.Z.append(dict(lv=np_, sd=sd, t0=T[npb], st=0, ts=None, bi=None, wx=None, rng=False))
+            if sd == 1:
+                self.PH = np_
+            else:
+                self.PL = np_
+            self.lastTyp = sd
+        self.Z = _keep(self.Z, self.keepN, live=lambda z: z['st'] == 0, nDead=self.keepD, side='sd')
+
+    def sweeps(self, tf):
+        """Alınan (st == 1) seviyeler: tepe alındı → SAT (−1) · dip alındı → AL (1)."""
+        out = []
+        for z in self.Z:
+            if z['st'] != 1:
+                continue
+            tp = z['sd'] == 1
+            nm = f"{tf} M9 swing {'tepe' if tp else 'dip'} {fmt(z['lv'])}" + \
+                 ((" · range RH" if tp else " · range RL") if z['rng'] else "")
+            out.append(dict(key=f"M9|{tf}|{z['t0']}|{z['sd']}", d=-z['sd'], bi=z['bi'],
+                            ad=nm + f" alındı · fitil {fmt(z['wx'])}", tag=""))
         return out
 
 

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-tarayici.py — PA POI tarayıcısı (M3 FVG · M5 OB/Breaker/KYK/iç OB · M6 EQH/EQL · M7 seviyeler · M8 anlamlı iç OB)
+tarayici.py — PA POI tarayıcısı (M3 FVG · M5 OB/Breaker/KYK/iç OB · M6 EQH/EQL · M7 seviyeler · M8 anlamlı iç OB
+              · M9 likidite alımı) — Pine ile eşit (22.11.2026: renk şartı, geçiş kuralı, yeni L/H, M9, lik.✓)
 
 Saatte bir çalışır (GitHub Actions). Coinler: piyasa değeri en yüksek 50 coin (stabil / sarılmış / stake hariç,
 Binance'te USDT vadeli çifti olanlar). POI'ler 4H / 1G / 1W'de hesaplanır; kapanan 1H mumlarında:
   • POI'ye İLK GİRİŞ  (TV'deki ▲ AL / ▼ SAT ile aynı kural)
   • POI'ye YAKLAŞTI   (kutuya dokunmadan %YAKLAS içinde; kutu başına bir kez)
-  • M6 EQH/EQL alındı (sweep) · M7 seviye sweep / ilk temas
+  • M6 EQH/EQL alındı (sweep) · M7 seviye sweep / ilk temas · M9 swing / range tepe-dip alındı
+  • POI sinyalinde son LQ_WIN (vars. 10) TF mumunda aynı yönde M9 alımı → "lik.✓"
 Her saat TÜM coinler tek mesajda (uzunsa bölünür). Bildirim: Telegram (TG_TOKEN + TG_CHAT) ve/veya ntfy (NTFY_TOPIC).
 
 Ortam ayarları (isteğe bağlı):
@@ -14,6 +16,7 @@ Ortam ayarları (isteğe bağlı):
   COIN_SAYISI   vars. 50
   POI_TF        vars. "4H,1G,1W"  (1H eklemek için "1H,4H,1G,1W")
   YAKLAS_YUZDE  vars. 0.5
+  LQ_WIN        vars. 10
 
 Kullanım:
   python tarayici.py                 → canlı, yeni olayları gönder
@@ -32,10 +35,12 @@ import urllib.parse
 import urllib.request
 
 from endeks import StabilSeri, endeks_bars
-from moduller import M3, M5, M6, M7, M8, fmt, zigzag2
+from moduller import M3, M5, M6, M7, M8, M9, fmt, zigzag2
 
 KLASOR = os.path.dirname(os.path.abspath(__file__))
 YAKLAS = float(os.environ.get("YAKLAS_YUZDE", "0.5"))
+# POI sinyali (M3 / M5 / M8) için: aynı TF'de son kaç mumda aynı yönde M9 likidite alımı → "lik.✓" (Pine lqWin)
+LQ_WIN = int(os.environ.get("LQ_WIN", "10"))
 COIN_SAYISI = int(os.environ.get("COIN_SAYISI", "50"))
 EK_COINLER = os.environ.get("EK_COINLER", "ATOM,OP,APT")         # her zaman taranacak ek coinler
 ENDEKS = os.environ.get("ENDEKS", "1") != "0"                    # TOTAL / TOTAL2 / BTC.D / USDT.D
@@ -294,9 +299,11 @@ def tara(bars, dur, poi_tf=None, yon=False, trend=None):
     yon=True (endeksler): ayrıca her TF'de yapı dönüşü (MSS) olayı; trend dict'ine son yön yazılır."""
     poi_tf = poi_tf or POI_TF
     Hb = bars["1H"]
-    mods = [[tf, B, [M3(B), M5(B), M6(B), M8(B)], 0, dur[tf]] for tf, B in bars.items() if tf in poi_tf]
+    mods = [[tf, B, [M3(B), M5(B), M6(B), M8(B), M9(B)], 0, dur[tf]] for tf, B in bars.items() if tf in poi_tf]
     m7 = M7(bars["1G"])
     touched, near, sent6 = set(), set(), set()
+    # M9 son likidite alımı (TF mum no): {tf: {1: dip alındı, −1: tepe alındı}} → POI sinyaline "lik.✓" (son LQ_WIN mum)
+    son_lq = {}
     olay = []
     onceki = {}
 
@@ -323,12 +330,20 @@ def tara(bars, dur, poi_tf=None, yon=False, trend=None):
         for tf, B, ms, j, d in mods:
             if j < 3:
                 continue
+            # M9 likidite alımı: kendi sinyali + son alım mumu (POI etiketi için)
+            for z in ms[4].sweeps(tf):
+                if z['key'] not in sent6:
+                    sent6.add(z['key'])
+                    son_lq.setdefault(tf, {})[z['d']] = z['bi']
+                    ekle(t0, "sinyal", z['d'], z['ad'], c)
             for x in ms:
                 if isinstance(x, M6):
                     for z in x.sweeps(tf):
                         if z['key'] not in sent6:
                             sent6.add(z['key'])
                             ekle(t0, "sinyal", z['d'], z['ad'] + _rng(z), c)
+                if isinstance(x, M9):
+                    continue
                 for z in x.zones(tf):
                     top, bot, d0, key = z['top'], z['bot'], z['d'], z['key']
                     if not z.get('onlyNear') and l <= top and h >= bot and key not in touched:
@@ -337,8 +352,13 @@ def tara(bars, dur, poi_tf=None, yon=False, trend=None):
                             ok = (d0 == 1 and fromUp) or (d0 == -1 and fromDn)
                             if ok or z['anySide']:
                                 touched.add(key)
+                            # GEÇİŞ KURALI (22.11): giriş mumu karşı ucu da aştı (fitil yeter) → sinyal yok
+                            if ok and z.get('thru') and (l < bot if d0 == 1 else h > top):
+                                ok = False
                             if ok:
-                                ekle(t0, "sinyal", d0, z['ad'] + _rng(z) + z['tag'], c)
+                                lq = son_lq.get(tf, {}).get(d0)
+                                lqt = f" lik.✓ ({j - 1 - lq} mum önce)" if lq is not None and j - 1 - lq <= LQ_WIN else ""
+                                ekle(t0, "sinyal", d0, z['ad'] + _rng(z) + z['tag'] + lqt, c)
                         continue
                     if key in touched or key in near:
                         continue
