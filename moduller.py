@@ -1,10 +1,11 @@
 """
-moduller.py — TradingView M3 / M5 / M6 / M7 / M8 / M9 Pine modüllerinin Python karşılığı (21.11 · eşitleme 22.11.2026:
-M3 renk şartı + geçiş kuralı · M5 / M8 geçiş kuralı + iç OB yeni L/H · M9 likidite alımı).
+moduller.py — TradingView M3 … M10 Pine modüllerinin Python karşılığı.
+21.11 ilk · 22.11 eşitleme · 25.11 EŞİTLEME: yeni M3 (2 temas, IFVG yok) · YENİ M4 range · M5 (KYK kuralı, çift yutan,
+swing OB, ★ likidite, sinyal filtresi, gövde bölgesi; iç OB = M8 sınıfı → "M5 iç OB") · YENİ M10 OTE.
 
 Her modül kendi zaman diliminin KAPANMIŞ mumlarını sırayla işler (Pine'daki request.security + [1]).
-Bar listesi: B = dict(t=[açılış ms], o=[], h=[], l=[], c=[]) ; mum i işlenir (Pine'da [1] = i, [2] = i-1 …).
-
+Bar listesi: B = dict(t=[açılış ms], o=[], h=[], l=[], c=[], v=[hacim]) ; mum i işlenir.
+Kutu modülleri (M5, M8, M10) zones(tf) → 1H temas döngüsü · olay modülleri (M3, M4) olaylar(tf) · M6 / M9 sweeps(tf).
 Modül ayarları TV varsayılanlarıyla aynıdır. ATR / volatilite yok.
 """
 
@@ -180,88 +181,265 @@ def _keep(lst, n, live=lambda z: True, nDead=None, side='d'):
 
 
 # ════════════════════════════════════════════════════════════════
-# M3 — FVG / IMB + Inverse FVG (CME gap yok)
+# M3 — FVG / IMB (24.11.2026 kural seti · pa-okul/03-kural/kural-02-fvg.md · IFVG YOK)
+#  Sinyal kendi TF mumunda (Pine: grafik TF = FVG TF): önceki mum dışarıda (kenara eşit dahil) + bu mum değdi.
+#  En fazla 2 temas · tek seferde fitil dahil geçiş → sinyal yok + sil · %51+ fitil dolumu → (giriş mumuysa önce
+#  sinyal) sil · uzak kenar ötesi gövde kapanışı → sil · kutu ≥ fiyatın %0,1'i · 3 aynı renk · yön başına 5.
 # ════════════════════════════════════════════════════════════════
 class M3:
     ad = "M3"
+    poi = True
 
-    def __init__(self, B, keepN=5, invOn=True, usedPct=51, reactOn=True, sameC=True, thruOn=True):
+    def __init__(self, B, keepN=5, minPct=0.1, usedPct=51, sigMax=2, thruOn=True, sameC=True):
         self.B = B
-        self.keepN, self.invOn, self.usedPct, self.reactOn = keepN, invOn, usedPct, reactOn
-        self.sameC, self.thruOn = sameC, thruOn
+        self.keepN, self.minPct, self.usedPct, self.sigMax = keepN, minPct, usedPct, sigMax
+        self.thruOn, self.sameC = thruOn, sameC
         self.Z = []
         self.sw = Swing()
+        self.ev = []
+
+    def step(self, i):
+        B = self.B
+        O, H, L, C, T = B['o'], B['h'], B['l'], B['c'], B['t']
+        self.sw.step(i, H[i], L[i], C[i])
+        tr = self.sw.t
+        keep = []
+        for z in self.Z:
+            d, zt, zb = z['d'], z['top'], z['bot']
+            fl = (zt - zb) * self.usedPct / 100
+            kill = False
+            touch = L[i] <= zt if d == 1 else H[i] >= zb
+            out = i >= 1 and ((L[i - 1] >= zt) if d == 1 else (H[i - 1] <= zb))
+            fil = (d == 1 and L[i] < zt - fl) or (d == -1 and H[i] > zb + fl)
+            if touch and out and z['e'] != i - 1:
+                thru = L[i] < zb if d == 1 else H[i] > zt
+                if self.thruOn and thru:
+                    kill = True                                   # tek seferde geçti → sinyal yok, sil
+                else:
+                    z['n'] += 1
+                    z['e'] = i
+                    ters = (d == 1 and tr == -1) or (d == -1 and tr == 1)
+                    self.ev.append(dict(key=f"{z['s']}|{d}|{z['n']}", d=d, bi=i, top=zt, bot=zb,
+                                        ad=f"M3 FVG{'+' if d == 1 else '-'}",
+                                        tag=f" · {z['n']}. temas" + (f" (%{self.usedPct}+ doldu → kullanıldı)" if fil else "")
+                                        + (" ⚠ trend tersi" if ters else "")))
+                    if z['n'] >= self.sigMax:
+                        kill = True
+            if not kill and fil:
+                kill = True
+            if not kill and ((d == 1 and C[i] < zb) or (d == -1 and C[i] > zt)):
+                kill = True
+            if not kill:
+                keep.append(z)
+        self.Z = keep
+        if i >= 2:
+            allG = all(C[k] > O[k] for k in (i, i - 1, i - 2))
+            allR = all(C[k] < O[k] for k in (i, i - 1, i - 2))
+            mn = C[i] * self.minPct / 100
+            if L[i] > H[i - 2] and L[i] - H[i - 2] >= mn and (not self.sameC or allG):
+                self.Z.append(dict(top=L[i], bot=H[i - 2], d=1, s=T[i - 2], n=0, e=-1))
+            if H[i] < L[i - 2] and L[i - 2] - H[i] >= mn and (not self.sameC or allR):
+                self.Z.append(dict(top=L[i - 2], bot=H[i], d=-1, s=T[i - 2], n=0, e=-1))
+        self.Z = _keep(self.Z, self.keepN)
+
+    def olaylar(self, tf):
+        ev, self.ev = self.ev, []
+        for z in ev:
+            z['key'] = f"M3|{tf}|{z['key']}"
+            z['ad'] = f"{tf} {z['ad']}"
+        return ev
+
+
+def _zz_noktasi(obj, r, i):
+    """Zig zag noktalarını birleştir (aynı türden daha uç → taşınır). obj: PH, PHb, PL, PLb, lastTyp."""
+    if r['hp'] is not None:
+        if obj.lastTyp == 1:
+            if r['hp'] > obj.PH:
+                obj.PH, obj.PHb = r['hp'], r['hpB']
+        else:
+            obj.PH, obj.PHb, obj.lastTyp = r['hp'], r['hpB'], 1
+    if r['lp'] is not None:
+        if obj.lastTyp == -1:
+            if r['lp'] < obj.PL:
+                obj.PL, obj.PLb = r['lp'], r['lpB']
+        else:
+            obj.PL, obj.PLb, obj.lastTyp = r['lp'], r['lpB'], -1
+
+
+# ════════════════════════════════════════════════════════════════
+# M4 — Range (24.11.2026 kural seti · pa-okul/03-kural/kural-03-range.md)
+#  Kilitli range: zig zag son tepe = RH, son dip = RL; sadece İPTAL olunca yeni range (iptalden sonraki tepe + dip).
+#  EQ = (RH + RL) / 2 · uç bölge = swing mumunun gövde–fitil arası · temas = bölgeye değip EQ'ya ilerleme
+#  (swing noktaları da 1. temas) · toplam 3 temas = yatay (onaylı) · iptal (log): kapanış < RL·√(RL/RH) / > RH·√(RH/RL)
+#  Sinyal (onaylı range): RL bölgesi teması + RL üstü kapanış ▲ / RH ▼ · sapma (dışarıda kapanış → içeri) · EQ hacimli
+#  geçiş (hacim > son 20 ort. × 1,5). Kendi TF mumunda (Pine: grafik TF).
+# ════════════════════════════════════════════════════════════════
+class M4:
+    ad = "M4"
+    poi = True
+
+    def __init__(self, B, needT=3, volLen=20, volMul=1.5):
+        self.B = B
+        self.needT, self.volLen, self.volMul = needT, volLen, volMul
+        self.sw = Swing()
+        self.PH = self.PL = self.PHb = self.PLb = None
+        self.lastTyp = 0
+        self.act = False
+        self.cxB = None
+        self.ev = []
+
+    def _govde(self, j, ust):
+        O, C = self.B['o'], self.B['c']
+        return max(O[j], C[j]) if ust else min(O[j], C[j])
 
     def step(self, i):
         B = self.B
         O, H, L, C = B['o'], B['h'], B['l'], B['c']
+        V = B.get('v')
         h, l, c = H[i], L[i], C[i]
-        self.sw.step(i, h, l, c)
-        keep = []
-        for z in self.Z:
-            d, zt, zb = z['d'], z['top'], z['bot']
-            if (d == 1 and c < zb) or (d == -1 and c > zt):
-                if self.invOn and not z['inv']:
-                    z.update(inv=True, d=-d, u=False, k=False)
-                else:
-                    continue
-            elif (self.thruOn and i >= 1 and not z['u'] and not z['k'] and
-                  ((d == 1 and L[i - 1] > zt and l < zb) or (d == -1 and H[i - 1] < zb and h > zt))):
-                # GEÇİŞ KURALI (22.11): ilk giriş mumu karşı ucu da aştı → IFVG; IFVG ise sil
-                if not z['inv']:
-                    z.update(inv=True, d=-d, u=False, k=False)
-                else:
-                    continue
-            elif not z['u']:
-                fl = (zt - zb) * self.usedPct / 100
-                if (d == 1 and l < zt - fl) or (d == -1 and h > zb + fl):
-                    z['u'] = True
-                else:
-                    if (d == 1 and l <= zt) or (d == -1 and h >= zb):
-                        z['k'] = True
-                    if self.reactOn and z['k'] and ((d == 1 and c > zt) or (d == -1 and c < zb)):
-                        z['u'] = True
-            keep.append(z)
-        self.Z = keep
-        if i >= 2:
-            h3, l3, t3 = B['h'][i - 2], B['l'][i - 2], B['t'][i - 2]
-            # RENK ŞARTI (22.11): 3 mum aynı renk (doji sayılmaz)
-            allG = all(C[k] > O[k] for k in (i, i - 1, i - 2))
-            allR = all(C[k] < O[k] for k in (i, i - 1, i - 2))
-            if l > h3 and (not self.sameC or allG):
-                self.Z.append(dict(top=l, bot=h3, d=1, inv=False, s=t3, u=False, k=False))
-            if h < l3 and (not self.sameC or allR):
-                self.Z.append(dict(top=l3, bot=h, d=-1, inv=False, s=t3, u=False, k=False))
-        self.Z = _keep(self.Z, self.keepN, live=lambda z: not z['u'])
+        # Pine'daki gibi: bu mum, ÖNCEKİ muma kadar onaylanmış zig zag noktalarıyla değerlendirilir
+        if not self.act and self.PH is not None and self.PL is not None and self.PH > self.PL \
+                and (self.cxB is None or min(self.PHb, self.PLb) >= self.cxB):
+            self.act = True
+            self.rh, self.rl, self.hB, self.lB = self.PH, self.PL, self.PHb, self.PLb
+            self.eq = (self.rh + self.rl) / 2
+            self.hz = max(self._govde(self.hB, True), self.eq)
+            self.lz = min(self._govde(self.lB, False), self.eq)
+            self.cDn = self.rl * math.sqrt(self.rl / self.rh)
+            self.cUp = self.rh * math.sqrt(self.rh / self.rl)
+            self.outD = 0
+            if self.hB < self.lB:
+                rc = any(H[k] >= self.eq for k in range(self.lB + 1, i))
+                self.nH, self.wH, self.nL, self.wL = 1, False, (1 if rc else 0), not rc
+            else:
+                rc = any(L[k] <= self.eq for k in range(self.hB + 1, i))
+                self.nL, self.wL, self.nH, self.wH = 1, False, (1 if rc else 0), not rc
+        if self.act:
+            if c < self.cDn or c > self.cUp:
+                self.act = False
+                self.cxB = i
+            else:
+                if self.wL and h >= self.eq:
+                    self.nL, self.wL = self.nL + 1, False
+                if self.wH and l <= self.eq:
+                    self.nH, self.wH = self.nH + 1, False
+                cf = self.nH + self.nL >= self.needT
+                tL = not self.wL and l <= self.lz
+                tH = not self.wH and h >= self.hz
+                if tL:
+                    self.wL = True
+                if tH:
+                    self.wH = True
+                if cf:
+                    if tL and c >= self.rl:
+                        self._ev(i, 1, "RL bölgesi teması", self.lz, self.rl)
+                    if tH and c <= self.rh:
+                        self._ev(i, -1, "RH bölgesi teması", self.rh, self.hz)
+                    if self.outD == -1 and c >= self.rl:
+                        self._ev(i, 1, "sapma: RL altı kapanış → içeri dönüş (lik. alındı)", self.lz, self.rl)
+                    if self.outD == 1 and c <= self.rh:
+                        self._ev(i, -1, "sapma: RH üstü kapanış → içeri dönüş (lik. alındı)", self.rh, self.hz)
+                    if V and i > self.volLen:
+                        va = sum(V[i - self.volLen:i]) / self.volLen
+                        if va > 0 and V[i] > va * self.volMul:
+                            if c > self.eq and C[i - 1] <= self.eq:
+                                self._ev(i, 1, f"EQ hacimli geçiş ↑ · hacim ×{V[i] / va:.2f}", self.eq, self.eq)
+                            if c < self.eq and C[i - 1] >= self.eq:
+                                self._ev(i, -1, f"EQ hacimli geçiş ↓ · hacim ×{V[i] / va:.2f}", self.eq, self.eq)
+                self.outD = -1 if c < self.rl else 1 if c > self.rh else 0
+        r = self.sw.step(i, h, l, c)
+        _zz_noktasi(self, r, i)
+
+    def _ev(self, i, d, ne, top, bot):
+        self.ev.append(dict(key=f"{self.hB}|{self.lB}|{i}|{d}|{ne[:6]}", d=d, bi=i, top=top, bot=bot,
+                            ad=f"M4 range {ne}",
+                            tag=f" · RH {fmt(self.rh)} / EQ {fmt(self.eq)} / RL {fmt(self.rl)} · {self.nH + self.nL} temas"))
+
+    def olaylar(self, tf):
+        ev, self.ev = self.ev, []
+        for z in ev:
+            z['key'] = f"M4|{tf}|{z['key']}"
+            z['ad'] = f"{tf} {z['ad']}"
+        return ev
+
+
+# ════════════════════════════════════════════════════════════════
+# M10 — OTE (0,618 – 0,786 · son zig zag bacağı) · 24.11.2026 · pa-okul/03-kural/kural-05-ote.md
+#  Son nokta tepe → yükselen bacak → AL OTE · son nokta dip → SAT OTE. Bacak başına tek sinyal (ilk giriş, 1H temas
+#  döngüsünde). İptal: bacak başlangıcının ötesinde gövde kapanışı. Yeni swing → yeni OTE.
+# ════════════════════════════════════════════════════════════════
+class M10:
+    ad = "M10"
+    poi = False
+
+    def __init__(self, B, fA=0.618, fB=0.786, fM=0.705, thruOn=True):
+        self.B = B
+        self.fA, self.fB, self.fM, self.thruOn = fA, fB, fM, thruOn
+        self.sw = Swing()
+        self.PH = self.PL = self.PHb = self.PLb = None
+        self.lastTyp = 0
+        self.leg = None
+
+    def step(self, i):
+        B = self.B
+        H, L, C, T = B['h'], B['l'], B['c'], B['t']
+        r = self.sw.step(i, H[i], L[i], C[i])
+        _zz_noktasi(self, r, i)
+        if self.PH is None or self.PL is None or self.PH <= self.PL:
+            return
+        k = (self.PHb, self.PLb)
+        if self.leg is None or self.leg['k'] != k:
+            d = 1 if self.PHb > self.PLb else -1
+            rg = self.PH - self.PL
+            a = self.PH - rg * self.fA if d == 1 else self.PL + rg * self.fA
+            b = self.PH - rg * self.fB if d == 1 else self.PL + rg * self.fB
+            self.leg = dict(k=k, d=d, top=max(a, b), bot=min(a, b), mid=self.PH - rg * self.fM if d == 1 else self.PL + rg * self.fM,
+                            org=self.PL if d == 1 else self.PH, H=self.PH, L=self.PL, t0=T[max(k)], dead=False)
+        elif not self.leg['dead']:
+            g = self.leg
+            if (g['d'] == 1 and C[i] < g['org']) or (g['d'] == -1 and C[i] > g['org']):
+                g['dead'] = True
 
     def zones(self, tf):
-        out = []
-        tr = self.sw.t
-        for z in self.Z:
-            if z['u']:
-                continue
-            d = z['d']
-            nm = f"{tf} M3 {'IFVG' if z['inv'] else 'FVG'}{'+' if d == 1 else '-'}"
-            tag = " ⚠ trend tersi" if (d == 1 and tr == -1) or (d == -1 and tr == 1) else ""
-            out.append(dict(key=f"M3|{tf}|{z['s']}|{d}|{'i' if z['inv'] else 'n'}", top=z['top'], bot=z['bot'],
-                            d=d, ad=nm, tag=tag, anySide=True, thru=self.thruOn))
-        return out
+        g = self.leg
+        if g is None or g['dead']:
+            return []
+        return [dict(key=f"M10|{tf}|{g['t0']}|{g['d']}", top=g['top'], bot=g['bot'], d=g['d'],
+                     ad=f"{tf} M10 OTE {'AL' if g['d'] == 1 else 'SAT'}",
+                     tag=f" · 0,705 {fmt(g['mid'])} · bacak {fmt(g['L'])} → {fmt(g['H'])}",
+                     anySide=False, thru=self.thruOn, eqOut=True, poi=False)]
 
 
 # ════════════════════════════════════════════════════════════════
-# M5 — Order Block + Breaker + KYK/YKY kutusu + iç yapı OB
+# M5 — Order Block + Breaker + KYK/YKY + çift yutan + swing OB + ★ likidite (24.11.2026 · kural-04-ob.md)
+#  İç yapı OB → M8 sınıfı (filtreli, eski M8; 24.11 M5'e taşındı, mesajda "M5 iç OB").
+#  SİNYAL FİLTRESİ (kullanıcı 24.11): ★ likidite alan OB · swing OB + A kalite ana OB · KYK/YKY + çift yutan
+#  (B kalite ana OB sinyal vermez). Sinyal GÖVDE bölgesine temasla (sigTop / sigBot); geçiş kuralı tüm kutuya göre.
 # ════════════════════════════════════════════════════════════════
+def _lqs(lv, lt, dd, o, h, l, c, tc):
+    """★ likidite: yutan mum doğru renkte, fitili önceki swing dibini (dd 1) / tepesini (dd −1) geçti + içeride kapandı.
+    lv / lt: seviye + onay mum no; sadece tc'den ÖNCE onaylananlar. → alınan seviye ya da None"""
+    if not (c > o if dd == 1 else c < o):
+        return None
+    for v, t in zip(reversed(lv), reversed(lt)):
+        if t < tc and ((l < v < c) if dd == 1 else (h > v > c)):
+            return v
+    return None
+
+
 class M5:
     ad = "M5"
+    poi = True
 
-    def __init__(self, B, keepN=5, brkOn=True, kykRef=10, kykMul=1.2, kykAvg=20, kykN=3, iobRef=5, iobN=3,
-                 thruOn=True, newOn=True):
+    def __init__(self, B, keepN=5, brkOn=True, kykRef=10, kykN=3, cyN=3, swLook=10, thruOn=True,
+                 sgLq=True, sgSwA=True, sgKC=True, sgB=False, bodyOn=True):
         self.B = B
         self.keepN, self.brkOn = keepN, brkOn
-        self.kykRef, self.kykMul, self.kykAvg, self.kykN = kykRef, kykMul, kykAvg, kykN
-        self.iobRef, self.iobN = iobRef, iobN
-        self.thruOn, self.newOn = thruOn, newOn
-        self.R, self.P, self.Q, self.IP, self.IQ = [], [], [], [], []
+        self.kykRef, self.kykN, self.cyN, self.swLook = kykRef, kykN, cyN, swLook
+        self.thruOn = thruOn
+        self.sgLq, self.sgSwA, self.sgKC, self.sgB, self.bodyOn = sgLq, sgSwA, sgKC, sgB, bodyOn
+        self.R, self.P, self.Q = [], [], []
+        self.SW, self.SLv, self.SLt, self.SHv, self.SHt = [], [], [], [], []
         self.sw = Swing()
         self.PH = self.PL = None
         self.lastTyp = 0
@@ -274,6 +452,18 @@ class M5:
         h, l, c = H[i], L[i], C[i]
         r = self.sw.step(i, h, l, c)
         rH, rL = self.PH, self.PL
+        # önceki swing noktaları (swing OB) + likidite seviyeleri (★)
+        if r['hp'] is not None:
+            self.SW.append(r['hp'])
+            self.SHv.append(r['hp'])
+            self.SHt.append(i)
+        if r['lp'] is not None:
+            self.SW.append(r['lp'])
+            self.SLv.append(r['lp'])
+            self.SLt.append(i)
+        self.SW = self.SW[-(self.swLook + 2):]
+        self.SHv, self.SHt = self.SHv[-self.swLook:], self.SHt[-self.swLook:]
+        self.SLv, self.SLt = self.SLv[-self.swLook:], self.SLt[-self.swLook:]
         if r['hp'] is not None:
             if self.lastTyp == 1:
                 if r['hp'] > self.PH:
@@ -287,88 +477,75 @@ class M5:
             else:
                 self.PL, self.lastTyp = r['lp'], -1
 
+        def lqs(dd, j):
+            return _lqs(self.SLv, self.SLt, 1, O[j], H[j], L[j], C[j], j) if dd == 1 else \
+                _lqs(self.SHv, self.SHt, -1, O[j], H[j], L[j], C[j], j)
+
         def tst(z):
             if l <= z['top'] and h >= z['bot'] and not (L[i - 1] <= z['top'] and H[i - 1] >= z['bot']):
                 z['test'] += 1
 
         def thru(z):
-            """GEÇİŞ KURALI (22.11): ilk giriş mumu (test yok, önceki mum tamamen dışarıda) karşı ucu da aştı."""
             d = z['d']
             return self.thruOn and z['test'] == 0 and (
                 (d == 1 and L[i - 1] > z['top'] and l < z['bot']) or (d == -1 and H[i - 1] < z['bot'] and h > z['top']))
 
-        def kutu_guncelle(lst):
-            """KYK ve iç OB: geçiş → ters rol (ters ise sil) · gövdeyle kırılım → sil · değilse test say."""
-            keep = []
-            for z in lst:
-                th = thru(z)
-                if th and not z['inv']:
-                    z.update(d=-z['d'], test=0, inv=True)
-                elif th or (z['d'] == -1 and c > z['top']) or (z['d'] == 1 and c < z['bot']):
-                    continue
-                else:
-                    tst(z)
-                keep.append(z)
-            return keep
-
-        # ── KYK / YKY kutuları
-        self.Q = kutu_guncelle(self.Q)
-        if i >= 3 + self.kykRef and i >= self.kykAvg + 1:
+        # ── KYK / YKY + çift yutan kutuları (onaylı): geçiş → ters rol (ters ise sil) · gövde kırılımı → sil · test
+        keep = []
+        for z in self.Q:
+            th = thru(z)
+            if th and not z['inv']:
+                z.update(d=-z['d'], test=0, inv=True)
+            elif th or (z['d'] == -1 and c > z['top']) or (z['d'] == 1 and c < z['bot']):
+                continue
+            else:
+                tst(z)
+            keep.append(z)
+        self.Q = keep
+        if i >= 4 + self.kykRef:
+            # KYK / YKY (24.11): GÖVDEYE göre 2. mum 1.'yi, 3. mum 2.'yi yutar + 3. mum ilk ikisinden ayrı ayrı büyük
             r1, g1 = C[i - 2] < O[i - 2], C[i - 2] > O[i - 2]
             r2, g2 = C[i - 1] < O[i - 1], C[i - 1] > O[i - 1]
             r3, g3 = C[i] < O[i], C[i] > O[i]
-            yut = max(O[i], C[i]) >= max(O[i - 1], C[i - 1]) and min(O[i], C[i]) <= min(O[i - 1], C[i - 1])
-            avgB = sum(abs(C[k] - O[k]) for k in range(i - self.kykAvg, i)) / self.kykAvg
-            big = abs(C[i] - O[i]) >= avgB * self.kykMul
-            if big and yut and ((r1 and g2 and r3) or (g1 and r2 and g3)):
+            t1, b1 = max(O[i - 2], C[i - 2]), min(O[i - 2], C[i - 2])
+            t2, b2 = max(O[i - 1], C[i - 1]), min(O[i - 1], C[i - 1])
+            t3, b3 = max(O[i], C[i]), min(O[i], C[i])
+            y21 = t2 >= t1 and b2 <= b1
+            y32 = t3 >= t2 and b3 <= b2
+            big = (t3 - b3) > (t1 - b1) and (t3 - b3) > (t2 - b2)
+            if y21 and y32 and big and ((r1 and g2 and r3) or (g1 and r2 and g3)):
                 ref = min(L[i - 2 - self.kykRef:i - 2]) if r1 else max(H[i - 2 - self.kykRef:i - 2])
-                self.P.append(dict(top=H[i - 2], bot=L[i - 2], d=-1 if r1 else 1, t0=T[i - 2], ref=ref))
-                if len(self.P) > 10:
-                    self.P.pop(0)
+                dd = -1 if r1 else 1
+                self.P.append(dict(top=H[i - 2], bot=L[i - 2], d=dd, t0=T[i - 2], ref=ref, cy=False,
+                                   lq=lqs(dd, i), bT=t1, bB=b1))
+            # ÇİFT YUTAN (24.11): ≥2 ardışık aynı renk mum + ters mum hepsinin gövdesini yutar
+            gY, rY = C[i] > O[i], C[i] < O[i]
+            if gY or rY:
+                k = i - 1
+                mT = mB = bxT = bxB = None
+                while k >= 0 and i - k <= 60 and (C[k] < O[k] if gY else C[k] > O[k]):
+                    mT = max(O[k], C[k]) if mT is None else max(mT, O[k], C[k])
+                    mB = min(O[k], C[k]) if mB is None else min(mB, O[k], C[k])
+                    bxT = H[k] if bxT is None else max(bxT, H[k])
+                    bxB = L[k] if bxB is None else min(bxB, L[k])
+                    k -= 1
+                f = k + 1
+                if i - f >= 2 and f - self.kykRef >= 0 and max(O[i], C[i]) >= mT and min(O[i], C[i]) <= mB:
+                    ref = max(H[f - self.kykRef:f]) if gY else min(L[f - self.kykRef:f])
+                    dd = 1 if gY else -1
+                    self.P.append(dict(top=bxT, bot=bxB, d=dd, t0=T[f], ref=ref, cy=True, lq=lqs(dd, i), bT=mT, bB=mB))
+            self.P = self.P[-20:]
         keepP = []
         for p in self.P:
             kill = c > p['top'] if p['d'] == -1 else c < p['bot']
             okB = c < p['ref'] if p['d'] == -1 else c > p['ref']
             if kill or okB:
                 if okB and not kill:
-                    self.Q.append(dict(top=p['top'], bot=p['bot'], d=p['d'], t0=p['t0'], test=0, inv=False))
+                    self.Q.append(dict(p, test=0, inv=False))
                 continue
             keepP.append(p)
         self.P = keepP
-        self.Q = _keep(self.Q, self.kykN)
-
-        # ── iç yapı OB
-        # YENİ L / H (22.11): hazır değilse önce temas → düşer; dokunmadan uç geçildi → hazır
-        keepI = []
-        for z in self.IQ:
-            if not z['rdy']:
-                if l <= z['top'] and h >= z['bot']:
-                    continue
-                if (z['d'] == -1 and l < z['ex']) or (z['d'] == 1 and h > z['ex']):
-                    z['rdy'] = True
-                keepI.append(z)
-            else:
-                keepI.extend(kutu_guncelle([z]))
-        self.IQ = keepI
-        keepP = []
-        for p in self.IP:
-            p['ex'] = min(p['ex'], l) if p['d'] == -1 else max(p['ex'], h)
-            gone = h > p['top'] if p['d'] == -1 else l < p['bot']
-            ok = c < p['ref'] if p['d'] == -1 else c > p['ref']
-            if gone or ok:
-                if ok and not gone:
-                    self.IQ.append(dict(top=p['top'], bot=p['bot'], d=p['d'], t0=p['t0'], test=0, inv=False,
-                                        ex=p['ex'], rdy=not self.newOn))
-                continue
-            keepP.append(p)
-        self.IP = keepP
-        gC, rC = C[i] > O[i], C[i] < O[i]
-        if (gC or rC) and i >= self.iobRef:
-            rf = min(L[i - self.iobRef:i]) if gC else max(H[i - self.iobRef:i])
-            self.IP.append(dict(top=h, bot=l, d=-1 if gC else 1, t0=T[i], ref=rf, ex=l if gC else h))
-            if len(self.IP) > 40:
-                self.IP.pop(0)
-        self.IQ = _keep(self.IQ, self.iobN, live=lambda z: z['rdy'])
+        self.Q = _keep([z for z in self.Q if z['cy']], self.cyN) + _keep([z for z in self.Q if not z['cy']], self.kykN)
 
         # ── mevcut OB: geçiş (çalışmayan → ters rol) · kırılım (breaker / sil) · test
         keepR = []
@@ -439,20 +616,26 @@ class M5:
             eq = None if rH is None or rL is None else (rH + rL) / 2
             mid = (top + bot) / 2
             okH = eq is not None and (mid <= eq if dd == 1 else mid >= eq)
+            psw = next((v for v in reversed(self.SW) if v != lgP and bot <= v <= top), None)
+            lq = lqs(dd, jo + 1) if jo + 1 <= i else None
             self.R.append(dict(top=top, bot=bot, d=dd, kind=r['kind'], liq=r['liq'], A=imb and okH, sw=isSw,
-                               cln=cln, kyk=kyk, brk=0, test=0, t0=T[jl]))
+                               cln=cln, kyk=kyk, brk=0, test=0, t0=T[jl], bT=bT, bB=bB, psw=psw, lq=lq))
         self.R = _keep(self.R, self.keepN)
 
     def zones(self, tf):
         out = []
         for z in self.R:
             d = z['d']
+            lk = z['brk'] == 0 and z['lq'] is not None
+            swo = z['psw'] is not None
+            if not ((self.sgLq and lk) or (self.sgSwA and (z['A'] or swo)) or (self.sgB and not z['A'])):
+                continue
             if z['brk'] == 1:
-                nm = f"{tf} M5 Breaker{'+' if d == 1 else '-'}"
+                nm = f"M5 Breaker{'+' if d == 1 else '-'}"
             elif z['brk'] == 2:
-                nm = f"{tf} M5 çalışmayan OB{'+' if d == 1 else '-'}"
+                nm = f"M5 çalışmayan OB{'+' if d == 1 else '-'}"
             else:
-                nm = f"{tf} M5 OB{'+' if d == 1 else '-'} {'A' if z['A'] else 'B'}"
+                nm = f"M5 {'★ lik. ' if lk else ''}{'swing OB' if swo else 'OB'}{'+' if d == 1 else '-'} {'A' if z['A'] else 'B'}"
             tag = ""
             if z['cln']:
                 tag += " ✓ temiz"
@@ -463,21 +646,29 @@ class M5:
                 tag += " lik."
             if z['kyk']:
                 tag += " YKY" if z['kyk'] == 1 else " KYK"
+            if swo:
+                tag += f" önceki swing {fmt(z['psw'])}"
+            if lk:
+                tag += f" · ★ GÜÇLÜ POI (2 onay: yutan mum {fmt(z['lq'])} likiditesini aldı)"
             if z['test']:
                 tag += f" test {z['test']}"
             out.append(dict(key=f"M5|{tf}|{z['t0']}|{d}|{z['brk']}", top=z['top'], bot=z['bot'], d=d,
-                            ad=nm, tag=tag, anySide=True, thru=self.thruOn))
+                            sigTop=z['bT'] if self.bodyOn else z['top'], sigBot=z['bB'] if self.bodyOn else z['bot'],
+                            ad=f"{tf} {nm}", tag=tag, anySide=True, thru=self.thruOn))
         for z in self.Q:
             d, v = z['d'], z['inv']
-            nm = ('YKY' if (-d if v else d) == 1 else 'KYK') + (f" çalışmayan{'+' if d == 1 else '-'}" if v else " kutusu")
-            out.append(dict(key=f"M5K|{tf}|{z['t0']}|{d}", top=z['top'], bot=z['bot'], d=d,
-                            ad=f"{tf} M5 {nm}", tag="", anySide=False, thru=self.thruOn))
-        for z in self.IQ:
-            if not z['rdy']:
+            lk = not v and z['lq'] is not None
+            if not (self.sgKC or (self.sgLq and lk)):
                 continue
-            nm = ("çalışmayan iç OB" if z['inv'] else "iç OB") + ('+' if z['d'] == 1 else '-')
-            out.append(dict(key=f"M5I|{tf}|{z['t0']}|{z['d']}", top=z['top'], bot=z['bot'], d=z['d'],
-                            ad=f"{tf} M5 {nm}", tag=" yeni L/H" if self.newOn else "", anySide=False, thru=self.thruOn))
+            d0 = -d if v else d
+            nm = (f"çift yutan OB{'+' if d0 == 1 else '-'}" if z['cy'] else ('YKY' if d0 == 1 else 'KYK') + ("" if v else " kutusu")) \
+                + (f" çalışmayan{'+' if d == 1 else '-'}" if v else "")
+            tag = f" · ★ GÜÇLÜ POI (2 onay: yutan mum {fmt(z['lq'])} likiditesini aldı)" if lk else ""
+            if z['test']:
+                tag += f" test {z['test']}"
+            out.append(dict(key=f"M5K|{tf}|{z['t0']}|{d}|{int(z['cy'])}", top=z['top'], bot=z['bot'], d=d,
+                            sigTop=z['bT'] if self.bodyOn else z['top'], sigBot=z['bB'] if self.bodyOn else z['bot'],
+                            ad=f"{tf} M5 {'★ lik. ' if lk else ''}{nm}", tag=tag, anySide=False, thru=self.thruOn))
         return out
 
 
@@ -486,6 +677,7 @@ class M5:
 # ════════════════════════════════════════════════════════════════
 class M6:
     ad = "M6"
+    poi = False
 
     def __init__(self, B, nSw=10, keepN=5, keepD=3):
         self.B = B
@@ -629,7 +821,9 @@ class M6:
 # M8 — Anlamlı iç yapı OB (likidite + FVG)
 # ════════════════════════════════════════════════════════════════
 class M8:
+    """Filtreli iç yapı OB (eski M8) — 24.11 M5'e taşındı; mesajda 'M5 iç OB'."""
     ad = "M8"
+    poi = True
 
     def __init__(self, B, iobRef=5, iobExp=30, iobN=3, liqOn=True, liqW=5, liqS=5, fvgOn=True,
                  wideOn=False, wideN=10, llOn=False, llS=3, newOn=True, thruOn=True):
@@ -707,7 +901,7 @@ class M8:
                 if ok and not gone:
                     self.Q.append(dict(top=p['top'], bot=p['bot'], d=pd, t0=p['t0'], test=0,
                                        lv=self.swHv if pd == -1 else self.swLv,
-                                       inv=False, ex=p['ex'], rdy=not self.newOn))
+                                       inv=False, ex=p['ex'], rdy=not self.newOn, bT=p['bT'], bB=p['bB']))
                 continue
             p['br'], p['fv'] = br, fv
             keepP.append(p)
@@ -726,7 +920,7 @@ class M8:
                     if rC and self.fH is not None:
                         rf = max(rf, self.fH)
                 self.P.append(dict(top=h, bot=l, d=dr, t0=T[i], ref=rf, bi=i, br=False, fv=False,
-                                   ex=l if gC else h))
+                                   ex=l if gC else h, bT=max(O[i], C[i]), bB=min(O[i], C[i])))
                 if len(self.P) > 200:
                     self.P.pop(0)
         self.Q = _keep(self.Q, self.iobN, live=lambda z: z['rdy'])
@@ -740,8 +934,9 @@ class M8:
             t = tg + ((" HH" if z['d'] == 1 else " LL") if self.llOn else "") + (" yeni L/H" if self.newOn else "")
             if z['test']:
                 t += f" test {z['test']}"
-            nm = ("M8 çalışmayan OB" if z['inv'] else "M8 OB") + ('+' if z['d'] == 1 else '-')
+            nm = ("M5 çalışmayan iç OB" if z['inv'] else "M5 iç OB") + ('+' if z['d'] == 1 else '-')
             out.append(dict(key=f"M8|{tf}|{z['t0']}|{z['d']}", top=z['top'], bot=z['bot'], d=z['d'],
+                            sigTop=z['bT'], sigBot=z['bB'],
                             ad=f"{tf} {nm}", tag=t, anySide=False, thru=self.thruOn))
         return out
 
@@ -752,6 +947,7 @@ class M8:
 # ════════════════════════════════════════════════════════════════
 class M9:
     ad = "M9"
+    poi = False
 
     def __init__(self, B, keepN=5, keepD=3):
         self.B = B

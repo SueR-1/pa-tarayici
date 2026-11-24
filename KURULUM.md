@@ -1,8 +1,21 @@
 # PA Tarayıcı — Kurulum (saatlik bildirim)
 
-Bu klasör TradingView modüllerinin (M3 FVG, M5 OB / Breaker / KYK / iç OB, M6 EQH/EQL, M7 seviyeler,
-M8 anlamlı iç OB) Python karşılığıdır. GitHub her saat başı çalıştırır, yeni olayları **Telegram** ve
+Bu klasör TradingView modüllerinin (M3 FVG, M4 Range, M5 OB / Breaker / KYK / çift yutan / iç OB, M6 EQH/EQL,
+M7 seviyeler, M9 likidite, M10 OTE) Python karşılığıdır. GitHub her saat başı çalıştırır, yeni olayları **Telegram** ve
 **ntfy** ile telefonuna gönderir. Bilgisayarının açık olması gerekmez.
+
+**25.11.2026 GÜNCELLEME (TV modülleriyle eşitlendi):**
+- **M3 FVG** yeni kurallar: bir FVG en fazla 2 temasta sinyal · tek mumda tamamen geçilirse sinyal yok · %51+ dolunca biter · IFVG yok.
+  Sinyal FVG'nin kendi TF mumu kapanınca gelir.
+- **M4 Range (YENİ):** kilitli range, 3 temas (uca değip EQ'ya ilerleme) = yatay range → RL/RH bölgesi teması,
+  sapma (dışarıda kapanış → içeri dönüş), EQ'nun hacimli geçişi (× 1,5). İptal: log mesafe (RH 120 / RL 100 → 91,29 / 131,45).
+- **M5 OB:** KYK kuralı (2 yutar 1, 3 yutar 2, 3 en büyük) · YENİ çift yutan OB · swing OB (önceki swing seviyesinde) ·
+  ★ likidite alan OB (yutan mum eski swing'i aldı = GÜÇLÜ POI). Sinyal sadece ★ / swing / A kalite / KYK / çift yutan ve
+  **gövde bölgesine** temasla. İç OB = eski M8 (filtreli) → mesajda "M5 iç OB".
+- **M10 OTE (YENİ):** son zig zag bacağının 0,618–0,786 bölgesi; bacak başına tek sinyal. POI sinyali OTE içindeyse "OTE✓".
+- **Endeks bloğu:** her coin sinyalinin altında TOTAL / TOTAL2 / BTC.D / USDT.D'nin 1H 4H 8H 12H 1G ZZ1+ZZ2 yönü,
+  karar TF (sinyal TF'nin bir üstü: 4H→8H, 1G→1W) uyumu ✅ / ◐ / ❌, "Skor x / 4" ve endeksin kendi POI teyidi
+  ("✓ USDT.D 8H POI'de SAT"). Sadece etiket — sinyal elenmez. AL için uyumlu: TOTAL ▲, TOTAL2 ▲, USDT.D ▼, BTC.D: BTC'de ▲ / altta ▼.
 
 **Coinler:** piyasa değeri en yüksek **50 coin** (CoinGecko sırası, her çalıştırmada güncellenir).
 Stabil coinler (USDT, USDC, DAI …) ve sarılmış / stake edilmiş tokenlar (WBTC, stETH …) hariç; sadece

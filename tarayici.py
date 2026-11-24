@@ -35,17 +35,23 @@ import urllib.parse
 import urllib.request
 
 from endeks import StabilSeri, endeks_bars
-from moduller import M3, M5, M6, M7, M8, M9, fmt, zigzag2
+from moduller import M3, M4, M5, M6, M7, M8, M9, M10, Swing, fmt, zigzag2
 
 KLASOR = os.path.dirname(os.path.abspath(__file__))
 YAKLAS = float(os.environ.get("YAKLAS_YUZDE", "0.5"))
-# POI sinyali (M3 / M5 / M8) için: aynı TF'de son kaç mumda aynı yönde M9 likidite alımı → "lik.✓" (Pine lqWin)
+# POI sinyali (M3 / M4 / M5 / M5 iç OB) için: aynı TF'de son kaç mumda aynı yönde M9 likidite alımı → "lik.✓" (Pine lqWin)
 LQ_WIN = int(os.environ.get("LQ_WIN", "10"))
 COIN_SAYISI = int(os.environ.get("COIN_SAYISI", "50"))
 EK_COINLER = os.environ.get("EK_COINLER", "ATOM,OP,APT")         # her zaman taranacak ek coinler
 ENDEKS = os.environ.get("ENDEKS", "1") != "0"                    # TOTAL / TOTAL2 / BTC.D / USDT.D
 POI_TF = [x.strip() for x in os.environ.get("POI_TF", "4H,1G,1W").split(",") if x.strip()]
 TFLER = [("1H", "1h", 60), ("4H", "4h", 240), ("1G", "1d", 1440), ("1W", "1w", 10080)]
+# ENDEKS BLOĞU (kullanıcı 24.11): endeks yönü 1H 4H 8H 12H 1G (+1W karar) · karar TF = sinyal TF'nin bir üstü
+ENDEKS_TF = ["1H", "4H", "8H", "12H", "1G", "1W"]
+GOSTER_TF = ["1H", "4H", "8H", "12H", "1G"]
+UST_TF = {"1H": "4H", "4H": "8H", "8H": "12H", "12H": "1G", "1G": "1W", "1W": "1W"}
+TEYIT_MUM = int(os.environ.get("TEYIT_MUM", "3"))       # endeks POI teyidi: coin sinyalinden en fazla kaç mum önce
+DUR_EK = {"8H": 480 * 60000, "12H": 720 * 60000}
 ADET = {"1h": 2000, "4h": 1500, "1d": 1000, "1w": 500}         # çekilecek mum sayısı
 DURUM = os.path.join(KLASOR, "durum.json")
 COIN_YEDEK = os.path.join(KLASOR, "coinler.json")
@@ -244,7 +250,7 @@ def veri_cek(kaynak, sym, interval, adet):
 
 def bars_from_rows(rows, dur_ms, now_ms):
     """Sadece KAPANMIŞ mumlar."""
-    B = dict(t=[], o=[], h=[], l=[], c=[])
+    B = dict(t=[], o=[], h=[], l=[], c=[], v=[])
     for r in rows:
         t = int(r[0])
         if t + dur_ms > now_ms:
@@ -254,6 +260,7 @@ def bars_from_rows(rows, dur_ms, now_ms):
         B['h'].append(float(r[2]))
         B['l'].append(float(r[3]))
         B['c'].append(float(r[4]))
+        B['v'].append(float(r[5]) if len(r) > 5 else 0.0)
     return B
 
 
@@ -299,7 +306,7 @@ def tara(bars, dur, poi_tf=None, yon=False, trend=None):
     yon=True (endeksler): ayrıca her TF'de yapı dönüşü (MSS) olayı; trend dict'ine son yön yazılır."""
     poi_tf = poi_tf or POI_TF
     Hb = bars["1H"]
-    mods = [[tf, B, [M3(B), M5(B), M6(B), M8(B), M9(B)], 0, dur[tf]] for tf, B in bars.items() if tf in poi_tf]
+    mods = [[tf, B, [M3(B), M4(B), M5(B), M6(B), M8(B), M9(B), M10(B)], 0, dur[tf]] for tf, B in bars.items() if tf in poi_tf]
     m7 = M7(bars["1G"])
     touched, near, sent6 = set(), set(), set()
     # M9 son likidite alımı (TF mum no): {tf: {1: dip alındı, −1: tepe alındı}} → POI sinyaline "lik.✓" (son LQ_WIN mum)
@@ -307,8 +314,21 @@ def tara(bars, dur, poi_tf=None, yon=False, trend=None):
     olay = []
     onceki = {}
 
-    def ekle(t0, tur, yon, metin, c, uzak=None):
-        olay.append(dict(t=t0, tur=tur, yon=yon, metin=metin, fiyat=c, uzak=uzak))
+    def ekle(t0, tur, yon, metin, c, uzak=None, tf=None):
+        olay.append(dict(t=t0, tur=tur, yon=yon, metin=metin, fiyat=c, uzak=uzak, tf=tf))
+
+    def ote(ms, tf, d0, h, l):
+        """POI sinyali + aynı TF'de M10 OTE bölgesi (aynı yön, iptal değil, bu 1H mumu değdi) → ' OTE✓'"""
+        for x in ms:
+            if isinstance(x, M10):
+                for z in x.zones(tf):
+                    if z['d'] == d0 and l <= z['top'] and h >= z['bot']:
+                        return f" OTE✓ [{fmt(z['bot'])}–{fmt(z['top'])}]"
+        return ""
+
+    def lqtag(tf, d0, j):
+        lq = son_lq.get(tf, {}).get(d0)
+        return f" lik.✓ ({j - 1 - lq} mum önce)" if lq is not None and j - 1 - lq <= LQ_WIN else ""
 
     for n in range(1, len(Hb['t'])):
         t0 = Hb['t'][n]
@@ -322,7 +342,7 @@ def tara(bars, dur, poi_tf=None, yon=False, trend=None):
         h, l, c = Hb['h'][n], Hb['l'][n], Hb['c'][n]
         if yon:
             for tf, B, ms, j, d in mods:
-                yt = ms[1].sw.t                                    # M5 swing motoru: 1 yükseliş · −1 düşüş
+                yt = ms[2].sw.t                                    # M5 swing motoru: 1 yükseliş · −1 düşüş
                 if onceki.get(tf) in (1, -1) and yt != onceki[tf]:
                     ekle(t0, "yon", yt, f"{tf} Zig Zag 1 yapısı {'YÜKSELİŞE ▲' if yt == 1 else 'DÜŞÜŞE ▼'} döndü (MSS)", c)
                 onceki[tf] = yt
@@ -331,23 +351,32 @@ def tara(bars, dur, poi_tf=None, yon=False, trend=None):
             if j < 3:
                 continue
             # M9 likidite alımı: kendi sinyali + son alım mumu (POI etiketi için)
-            for z in ms[4].sweeps(tf):
+            for z in ms[5].sweeps(tf):
                 if z['key'] not in sent6:
                     sent6.add(z['key'])
                     son_lq.setdefault(tf, {})[z['d']] = z['bi']
-                    ekle(t0, "sinyal", z['d'], z['ad'], c)
+                    ekle(t0, "sinyal", z['d'], z['ad'], c, tf=tf)
             for x in ms:
                 if isinstance(x, M6):
                     for z in x.sweeps(tf):
                         if z['key'] not in sent6:
                             sent6.add(z['key'])
-                            ekle(t0, "sinyal", z['d'], z['ad'] + _rng(z), c)
-                if isinstance(x, M9):
+                            ekle(t0, "sinyal", z['d'], z['ad'] + _rng(z), c, tf=tf)
+                if hasattr(x, 'olaylar'):                          # M3 / M4: kendi TF mumunda sinyal
+                    for z in x.olaylar(tf):
+                        if z['key'] not in sent6:
+                            sent6.add(z['key'])
+                            ekle(t0, "sinyal", z['d'], z['ad'] + _rng(z) + z['tag'] + lqtag(tf, z['d'], j)
+                                 + ote(ms, tf, z['d'], h, l), c, tf=tf)
+                    continue
+                if not hasattr(x, 'zones') or isinstance(x, M9):
                     continue
                 for z in x.zones(tf):
                     top, bot, d0, key = z['top'], z['bot'], z['d'], z['key']
-                    if not z.get('onlyNear') and l <= top and h >= bot and key not in touched:
-                        fromUp, fromDn = pl > top, ph < bot
+                    # sinyal bölgesi: gövde (M5 24.11) ya da kutu · geçiş kuralı tüm kutuya göre
+                    sT, sB = z.get('sigTop', top), z.get('sigBot', bot)
+                    if not z.get('onlyNear') and l <= sT and h >= sB and key not in touched:
+                        fromUp, fromDn = (pl >= sT, ph <= sB) if z.get('eqOut') else (pl > sT, ph < sB)
                         if fromUp or fromDn:
                             ok = (d0 == 1 and fromUp) or (d0 == -1 and fromDn)
                             if ok or z['anySide']:
@@ -356,18 +385,18 @@ def tara(bars, dur, poi_tf=None, yon=False, trend=None):
                             if ok and z.get('thru') and (l < bot if d0 == 1 else h > top):
                                 ok = False
                             if ok:
-                                lq = son_lq.get(tf, {}).get(d0)
-                                lqt = f" lik.✓ ({j - 1 - lq} mum önce)" if lq is not None and j - 1 - lq <= LQ_WIN else ""
-                                ekle(t0, "sinyal", d0, z['ad'] + _rng(z) + z['tag'] + lqt, c)
+                                poi = z.get('poi', True)
+                                ekle(t0, "sinyal", d0, z['ad'] + _rng(z) + z['tag']
+                                     + (lqtag(tf, d0, j) + ote(ms, tf, d0, h, l) if poi else ""), c, tf=tf)
                         continue
                     if key in touched or key in near:
                         continue
-                    if d0 == 1 and top < l <= top * (1 + YAKLAS / 100):
+                    if d0 == 1 and sT < l <= sT * (1 + YAKLAS / 100):
                         near.add(key)
-                        ekle(t0, "yakin", 1, z['ad'] + _rng(z) + z['tag'], c, (l - top) / top * 100)
-                    elif d0 == -1 and bot * (1 - YAKLAS / 100) <= h < bot:
+                        ekle(t0, "yakin", 1, z['ad'] + _rng(z) + z['tag'], c, (l - sT) / sT * 100, tf=tf)
+                    elif d0 == -1 and sB * (1 - YAKLAS / 100) <= h < sB:
                         near.add(key)
-                        ekle(t0, "yakin", -1, z['ad'] + _rng(z) + z['tag'], c, (bot - h) / bot * 100)
+                        ekle(t0, "yakin", -1, z['ad'] + _rng(z) + z['tag'], c, (sB - h) / sB * 100, tf=tf)
         s7 = m7.bar(Hb, n)
         if any(s[0] == 1 for s in s7) and any(s[0] == -1 for s in s7):
             ekle(t0, "sinyal", 0, "⚠ AL+SAT çelişki: " + " | ".join(s[1] for s in s7), c)
@@ -378,7 +407,7 @@ def tara(bars, dur, poi_tf=None, yon=False, trend=None):
             ekle(t0, "yakin", s[0], s[1], c, s[3])
     if trend is not None:
         for tf, B, ms, j, d in mods:
-            trend[tf] = dict(zz1=ms[1].sw.t, zz2=zigzag2(B, j))
+            trend[tf] = dict(zz1=ms[2].sw.t, zz2=zigzag2(B, j))
     return olay
 
 
@@ -395,7 +424,7 @@ def _satir(o):
         return f"🧭 {o['metin']}"
     if o['tur'] == "sinyal":
         ic = {1: "🟢 ▲ AL", -1: "🔴 ▼ SAT"}.get(o['yon'], "⚪")
-        return f"{ic} · {o['metin']}"
+        return f"{ic} · {o['metin']}" + (("\n" + o['ek']) if o.get('ek') else "")
     ok = "↓ desteğe" if o['yon'] == 1 else "↑ dirence"
     return f"👀 YAKLAŞTI {ok} · {o['metin']} · %{o['uzak']:.2f} uzakta"
 
@@ -405,6 +434,80 @@ def _esc(x):
 
 
 ENDEKS_AD = ("TOTAL", "TOTAL2", "BTC.D", "USDT.D")
+
+
+def ek_tf(H):
+    """1H mumlarından 8H ve 12H (UTC 00:00 hizalı) — endeks bloğu için."""
+    def agg(dur_ms):
+        A = dict(t=[], o=[], h=[], l=[], c=[])
+        cur = None
+        for k in range(len(H['t'])):
+            b = H['t'][k] // dur_ms * dur_ms
+            if b != cur:
+                cur = b
+                for x in "tohlc":
+                    A[x].append(b if x == "t" else H[x][k])
+            else:
+                A['h'][-1] = max(A['h'][-1], H['h'][k])
+                A['l'][-1] = min(A['l'][-1], H['l'][k])
+                A['c'][-1] = H['c'][k]
+        # son (açık) mumu at: kapanmamış olabilir
+        if A['t'] and A['t'][-1] + dur_ms > H['t'][-1] + H1:
+            for x in "tohlc":
+                A[x].pop()
+        return A
+    return {"8H": agg(8 * H1), "12H": agg(12 * H1)}
+
+
+def endeks_yon(bars):
+    """{tf: (ZZ1, ZZ2)} — ENDEKS_TF'lerde; 1 yükseliş · −1 düşüş · 0 belirsiz."""
+    out = {}
+    for tf in ENDEKS_TF:
+        B = bars.get(tf)
+        if not B or len(B['t']) < 3:
+            continue
+        s = Swing()
+        for j in range(len(B['t'])):
+            s.step(j, B['h'][j], B['l'][j], B['c'][j])
+        out[tf] = (s.t, zigzag2(B, len(B['t']))[0])
+    return out
+
+
+def endeks_blok(coin, o, eyon, e_poi, dur):
+    """Coin sinyali altına piyasa bloğu (kullanıcı 24.11, sadece etiket).
+    Uyum (AL; SAT tersi): TOTAL ▲ · TOTAL2 ▲ · USDT.D ▼ · BTC.D: BTC'de ▲, altcoinde ▼. BTC'de TOTAL2 sayılmaz.
+    Karar TF = sinyal TF'nin bir üstü (UST_TF) · ✅ ZZ1+ZZ2 uyumlu (1) · ◐ biri (0,5) · ❌ ikisi ters (0).
+    Teyit: endeks karar TF'de kendi POI'sinde uyumlu yönde sinyal verdiyse (en fazla TEYIT_MUM sinyal-TF mumu önce)."""
+    d, tf = o['yon'], o['tf']
+    K = UST_TF.get(tf, tf)
+    btc = coin == "BTC"
+    want = {"TOTAL": d, "TOTAL2": d, "BTC.D": d if btc else -d, "USDT.D": -d}
+    sat = [f"   🧭 Piyasa (karar TF {K} · ▲▼ = ZZ1 ZZ2)"]
+    puan, say = 0.0, 0
+    for ad in ENDEKS_AD:
+        y = eyon.get(ad)
+        if not y:
+            continue
+        parca = " ".join(f"{t} {_ok(y[t][0])}{_ok(y[t][1])}" for t in GOSTER_TF if t in y)
+        if btc and ad == "TOTAL2":
+            sat.append(f"   {ad:<6} {parca}  (BTC'de sayılmaz)")
+            continue
+        k = y.get(K)
+        m = ((k[0] == want[ad]) + (k[1] == want[ad])) if k else 0
+        puan += m / 2
+        say += 1
+        sat.append(f"   {ad:<6} {parca}  {'✅' if m == 2 else '◐' if m == 1 else '❌'}")
+    adim = dur.get(tf, H1)
+    tey = []
+    for ad, e in e_poi:
+        if e.get('tf') != K or ad not in want or (btc and ad == "TOTAL2"):
+            continue
+        if e['yon'] == want[ad] and o['t'] - TEYIT_MUM * adim <= e['t'] <= o['t']:
+            n = (o['t'] - e['t']) // adim
+            tey.append(f"✓ {ad} {K} POI'de {'AL' if e['yon'] == 1 else 'SAT'} ({'aynı mum' if n == 0 else f'{n} mum önce'})")
+    sat.append(f"   Skor {f'{puan:g}'.replace('.', ',')} / {say}" + (" · " + " · ".join(dict.fromkeys(tey)) if tey else ""))
+    return "\n".join(sat)
+
 
 
 def _ok(d):
@@ -455,7 +558,7 @@ def mesaj(olaylar, kaynak, sinir=3800, endeks=None):
         if endeks:
             son = "\n<i>(endeksler Binance + CoinGecko verisinden hesaplanır; TV değerlerinden biraz farklı olabilir)</i>"
         else:
-            son = f"\n(veri: {kaynak} · POI TF: {', '.join(POI_TF)} · karar 15m'de SENİN)"
+            son = f"\n(veri: {kaynak} · POI TF: {', '.join(POI_TF)} · son karar SENİN)"
         cur = bas
         for b in bloklar:
             if len(cur) + len(b) + len(son) > sinir:
@@ -519,6 +622,7 @@ def main(argv):
         pass
     now = int(time.time() * 1000)
     dur = {tf: m * 60000 for tf, _, m in TFLER}
+    dur.update(DUR_EK)
     mod = argv[0] if argv else ""
 
     if mod == "--yerel":
@@ -564,7 +668,7 @@ def main(argv):
         raise RuntimeError("Hiç coin taranamadı")
 
     # ── piyasa yönü: TOTAL / TOTAL2 / BTC.D / USDT.D
-    yon_ol, trendler, efiyat = [], {}, {}
+    yon_ol, trendler, efiyat, eyon, e_poi = [], {}, {}, {}, []
     if ENDEKS and piyasa:
         try:
             gl = cg_global()
@@ -584,16 +688,28 @@ def main(argv):
                 eb = endeks_bars(tum_bars, arz, btc_mcap, toplam, stb)
                 for ad in ENDEKS_AD:
                     if ad in eb:
+                        eb[ad].update(ek_tf(eb[ad]["1H"]))
                         tr = {}
-                        for o in tara(eb[ad], dur, yon=True, trend=tr):
-                            yon_ol.append((ad, o))
+                        # POI olayları: mesajda POI_TF; karar TF teyidi için 8H / 12H de taranır
+                        for o in tara(eb[ad], dur, poi_tf=sorted(set(POI_TF) | {"8H", "12H"}), yon=True, trend=tr):
+                            if o.get('tf') in POI_TF or o['tur'] == "yon" and any(o['metin'].startswith(x + " ") for x in POI_TF):
+                                yon_ol.append((ad, o))
+                            if o['tur'] == "sinyal":
+                                e_poi.append((ad, o))
                         trendler[ad] = tr
+                        eyon[ad] = endeks_yon(eb[ad])
                         efiyat[ad] = eb[ad]["1H"]['c'][-1]
                 cgp = gl["pct"]
                 print("Endeks (şimdi): " + " · ".join(f"{a} {fmt(efiyat[a])}" for a in efiyat)
                       + f" | CoinGecko: toplam {fmt(toplam)} · BTC.D {cgp['btc']:.2f} · USDT.D {cgp.get('usdt', 0):.2f}")
         except Exception as e:  # noqa: BLE001
             print(f"⚠ endeksler hesaplanamadı: {e}", file=sys.stderr)
+
+    # ── coin sinyallerine endeks bloğu (sadece etiket; eleme yok)
+    if eyon:
+        for coin, o in tum:
+            if o['tur'] == "sinyal" and o.get('tf') and o['yon'] in (1, -1):
+                o['ek'] = endeks_blok(coin, o, eyon, e_poi, dur)
 
     if mod == "--son":
         saat = int(argv[1]) if len(argv) > 1 else 24
