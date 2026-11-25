@@ -723,7 +723,7 @@ def main(argv):
     if os.path.exists(DURUM):
         with open(DURUM, encoding="utf-8") as f:
             durum = json.load(f)
-    bas = max(durum.get("son_mum", son - H1), son - 6 * H1)    # en fazla son 6 saat (kaçan çalıştırmalar)
+    bas = max(durum.get("son_mum", son - H1), son - 24 * H1)    # en fazla son 24 saat (GitHub zamanlaması 9-13 saat gecikebiliyor)
     yeni_y = [x for x in yon_ol if bas < x[1]['t'] <= son]
     yeni = [x for x in tum if bas < x[1]['t'] <= son]
     m_y = mesaj(yeni_y, kaynak[2], endeks=(trendler, efiyat))
